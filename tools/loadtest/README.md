@@ -77,6 +77,20 @@ sub2api 的 CPU 占用超过约 60–65% 后，尾延迟开始明显变差。这
 
 3000 条并发流（71KB 请求体，每秒 1 个事件，单请求约 32 秒，约 95 rps）：sub2api 占 1.03 核，RSS 峰值 1766 MB，无错误。空载 RSS 约 175 MB，折合每个在途的 71KB 请求约 0.5–0.6 MB。
 
+### 长上下文（约 850KB 请求体，60 轮工具调用）
+
+200 条并发流，上游首字节 2s，100 个事件、间隔 100ms（单请求约 12 秒，约 18 rps），sub2api 绑 2 核：
+
+| 链路 | sub2api CPU | 每请求 CPU | RSS 峰值 | 流式期间常驻堆 | 每请求累计分配 |
+|---|---|---|---|---|---|
+| Anthropic `/v1/messages` | 0.84 核 | 47 ms | 591 MB | 约 0.85 MB/请求（1 份请求体） | 约 2.7 MB（请求体的 3 倍） |
+| OpenAI `/v1/responses` | 1.05 核 | 59 ms | 700 MB | 约 0.94 MB/请求（1 份请求体） | 约 18 MB（请求体的 20 倍） |
+
+- 主转发链路不做 tiktoken 计数；`tiktoken-go` 只在 `count_tokens` / `input_tokens` 接口里用。计费用的是上游返回的 usage。
+- 流式期间只常驻 1 份原始请求体（`readRequestBodyChunks`）；其余都是解析和改写阶段的瞬时分配，靠 GC 回收。折算 RSS 约为每个在途请求 2.2–2.7 MB（请求体的 2.5–3 倍）。
+- Responses 链路的瞬时分配大头是对整个请求体的多次完整 JSON 解码：`normalizeCodexCallOutputBootstrap`（约一半）、`NormalizeCompactionTriggerInputOrder`、`hasUniqueJSONMembers`、`HasCompactionTriggerInInput` 等。
+- “每请求累计分配”由堆 profile 的采样差值除以估算的请求数得出，是量级估计。
+
 ### 每请求对依赖的压力
 
 | 依赖 | 每请求 |
