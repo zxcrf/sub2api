@@ -106,3 +106,58 @@ sub2api 的 CPU 占用超过约 60–65% 后，尾延迟开始明显变差。这
 1. **热路径上有未走缓存的 SQL。** Anthropic 分组每个请求都会执行 3 次 `SELECT ... FROM settings`、1 次 `SELECT rpm_override FROM user_group_rate_multipliers`、1 次 `SELECT ... FROM account_groups`。最后一条来自调度快照回源：Redis 里每个请求都在读 `sched:*:antigravity:forced` 这个桶，该分组下没有 antigravity 账号，疑似空结果没被缓存。
 2. **数据库吃紧时 OpenAI 分组直接返回 503。** PG 连接耗尽期间出现过 `basispoints_image_settings_unavailable`：图片中转设置读取失败时，纯文本请求也被拒绝。
 3. **日志量大。** 按每请求 5 KB 算，200 rps 时约 1 MB/s。
+
+## 与 new-api 的对比（v1.0.0-rc.49，2026-11-08）
+
+同一台机器、同一套 mock 和请求体、同样的绑核方式（被测进程 2 核）。new-api 按其官方 compose 的环境变量启动（PostgreSQL + Redis、`BATCH_UPDATE_ENABLED=true`、`ERROR_LOG_ENABLED=true`），每平台 50 个渠道、50 个用户令牌，前端用占位页编译。sub2api 列出两种 PG 空闲连接配置：官方 compose 默认的 10，以及调到 50。
+
+### 饱和吞吐（上游零延迟，71KB 请求体，流式 60 事件，48 并发）
+
+| 链路 | new-api | sub2api（空闲连接 50） | sub2api（compose 默认 10） |
+|---|---|---|---|
+| Anthropic `/v1/messages` | 196 rps，10.0 ms/请求 | 283 rps，6.8 ms/请求 | 157 rps，9.0 ms/请求 |
+| OpenAI `/v1/responses` | 131 rps，14.9 ms/请求 | 164 rps，11.7 ms/请求 | 102 rps，15.0 ms/请求 |
+| OpenAI `/v1/chat/completions` | 142 rps，13.6 ms/请求 | 227 rps，8.3 ms/请求 | 124 rps，10.9 ms/请求 |
+
+compose 默认配置下 sub2api 的 CPU 只用到 1.4–1.5 核就上不去了：`DATABASE_MAX_IDLE_CONNS=10` 让连接池不停关闭又重建 PG 连接（一次 14 秒的压测里新建了 2059 个会话，调到 50 后是 36 个），PG 的 fork 开销把另外两个核占满。
+
+### 真实形态流式（上游首字节 800ms，100 事件、间隔 30ms，71KB）
+
+| 场景 | 指标 | new-api | sub2api（空闲连接 50） |
+|---|---|---|---|
+| Anthropic，300 并发流 | CPU / 每请求 | 1.12 核 / 14.2 ms | 1.11 核 / 14.0 ms |
+| | 附加 TTFB p50 / p99 | +11 / +32 ms | +13 / +79 ms |
+| | RSS 峰值 | 305 MB | 286 MB |
+| Responses，200 并发流 | CPU / 每请求 | 1.07 核 / 20.3 ms | 1.12 核 / 21.2 ms |
+| | 附加 TTFB p50 / p99 | +16 / +52 ms | +52 / +148 ms |
+| | RSS 峰值 | 273 MB | 357 MB |
+| Chat Completions，300 并发流 | CPU / 每请求 | 1.40 核 / 17.8 ms | 1.16 核 / 14.6 ms |
+| | 附加 TTFB p50 / p99 | +55 / +165 ms | +52 / +188 ms |
+| | RSS 峰值 | 330 MB | 461 MB |
+
+### 长上下文（约 850KB，200 并发流，上游首字节 2s）
+
+| 场景 | 指标 | new-api | sub2api（空闲连接 50） |
+|---|---|---|---|
+| Anthropic | CPU / 每请求 | 0.87 核 / 48.9 ms | 0.84 核 / 47.0 ms |
+| | 附加 TTFB p50 / p99 | +54 / +97 ms | +52 / +98 ms |
+| | RSS 峰值 | 1273 MB | 700 MB |
+| Responses | CPU / 每请求 | 1.44 核 / 98.6 ms | 1.06 核 / 59.2 ms |
+| | 附加 TTFB p50 / p99 | +1543 / +5288 ms | +203 / +334 ms |
+| | RSS 峰值 | 1246 MB | 780 MB |
+
+new-api 这一档的 CPU profile 里，`tokenkit.Count`（tiktoken）占 CPU 采样的约 60%。它默认 `CountToken=true`，对 OpenAI GPT / o 系列模型做精确计数，其他模型（如 Claude）走估算，所以 Anthropic 链路上看不到这项开销。
+
+### 每请求对依赖的压力（Anthropic，71KB）
+
+| | new-api | sub2api |
+|---|---|---|
+| PostgreSQL 事务 | 约 2 | 约 10 |
+| Redis 命令 | 约 29 | 约 71 |
+| 空载 RSS | 约 85 MB | 约 80–160 MB |
+
+### 口径限制
+
+- 两边都只测了“API Key 渠道直转”这一种形态。sub2api 的 OAuth 订阅账号调度、new-api 的多渠道重试和各类可选功能都没有覆盖。
+- 两个项目的功能不等价（计费模型、调度策略、日志内容都不同），数字只说明同一负载下各自的开销。
+- 每个场景只跑了一轮，没有重复取均值；相差 10% 以内的项不宜当作有差别。
